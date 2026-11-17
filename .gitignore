@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+logs_backup_*/
+models_backup_*/
+results_backup_*/
+_old/

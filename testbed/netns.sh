@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Two-namespace testbed: ns_c (client) <-> veth pair <-> ns_s (server).
+# Usage: sudo ./netns.sh up [RATE_MBIT] [ONE_WAY_DELAY_MS] [LOSS_PCT]
+#        sudo ./netns.sh down
+#        sudo ./netns.sh show
+# Defaults give ~40 ms RTT and 10 Mbit/s (scenario S1).
+# Shaping is applied in BOTH directions: delay (+loss) via netem on each end,
+# rate limit via tbf with a queue of about one BDP on the server->client direction.
+set -euo pipefail
+
+cmd=${1:-}
+RATE=${2:-10}      # Mbit/s
+DELAY=${3:-20}     # ms one way (RTT = 2x)
+LOSS=${4:-0}       # percent random loss
+QPCT=${5:-100}     # queue size as % of one BDP (100 = 1 BDP)
+
+case "$cmd" in
+  up)
+    "$0" down 2>/dev/null || true
+    ip netns add ns_c
+    ip netns add ns_s
+    ip link add veth_c type veth peer name veth_s
+    ip link set veth_c netns ns_c
+    ip link set veth_s netns ns_s
+    ip netns exec ns_c ip addr add 10.0.0.1/24 dev veth_c
+    ip netns exec ns_s ip addr add 10.0.0.2/24 dev veth_s
+    ip netns exec ns_c ip link set lo up
+    ip netns exec ns_s ip link set lo up
+    ip netns exec ns_c ip link set veth_c up
+    ip netns exec ns_s ip link set veth_s up
+
+    # Bandwidth-delay product in bytes: rate(bit/s)/8 * RTT(s)
+    BDP=$(( RATE * 1000000 / 8 * 2 * DELAY / 1000 * QPCT / 100 ))
+    [ "$BDP" -lt 3000 ] && BDP=3000
+
+    # server -> client: netem (delay, loss) then tbf (rate, queue = 1 BDP)
+    ip netns exec ns_s tc qdisc add dev veth_s root handle 1: netem delay "${DELAY}ms" loss "${LOSS}%"
+    ip netns exec ns_s tc qdisc add dev veth_s parent 1:1 handle 10: tbf \
+        rate "${RATE}mbit" burst 32kbit limit "$BDP"
+    # client -> server: delay and loss only (ACK path)
+    ip netns exec ns_c tc qdisc add dev veth_c root netem delay "${DELAY}ms"
+    echo "up: rate=${RATE}Mbit/s rtt=$((2*DELAY))ms loss=${LOSS}% queue=${BDP}B (${QPCT}% of BDP)"
+    ;;
+  down)
+    ip netns del ns_c 2>/dev/null || true
+    ip netns del ns_s 2>/dev/null || true
+    ;;
+  show)
+    ip netns exec ns_s tc -s qdisc show dev veth_s
+    ip netns exec ns_c tc -s qdisc show dev veth_c
+    ;;
+  *)
+    echo "usage: $0 up [RATE_MBIT] [ONE_WAY_DELAY_MS] [LOSS_PCT] | down | show" >&2
+    exit 1
+    ;;
+esac

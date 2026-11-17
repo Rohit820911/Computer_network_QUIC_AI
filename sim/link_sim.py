@@ -1,0 +1,206 @@
+"""Single-bottleneck link simulator (Phase 4). Pure Python, no aioquic.
+
+Time advances in 1 ms steps. Each step the sender sends (limited by cwnd and by
+pacing at cwnd/srtt, like aioquic), random loss is applied at the link input, the
+queue tail-drops when full, the link serves bytes at the current rate, served bytes
+come back as ACKs one base RTT (+ queueing delay) later, and lost bytes are detected
+by the sender about one RTT after they were dropped.
+
+The lab (testbed/netns.sh) is mirrored on purpose: queue sized in bytes at the start
+of a run, bandwidth drop at a fixed time, IP/UDP header overhead on the link.
+
+Simplifications (say so in the report): fluid bytes instead of individual packets,
+no ACK-path queueing or loss, no reordering, no retransmission timers, no QUIC
+handshake. The sim-to-real gap is a measured result (H4), not something to hide.
+"""
+import math
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+
+MSS = 1200
+# Per-packet overhead (bytes) between the link rate and the bytes the controller counts:
+# IP + UDP = 28, plus about 45 for QUIC (short header, packet number, AEAD tag, STREAM
+# frame header). The 45 is a calibration: it makes simulated Reno on S1 match the
+# measured Reno goodput (9.26 Mbit/s). Only the Reno baseline was used for this, not
+# the learned agent, so the sim-to-real comparison (H4) stays honest.
+HEADER = 73
+MIN_CWND = 2 * MSS
+MAX_CWND = 1000 * MSS
+INIT_CWND = 10 * MSS
+DT = 0.001
+
+
+@dataclass
+class LinkParams:
+    bw_mbps: float
+    rtt: float                 # base round-trip time, seconds
+    queue_bytes: float
+    loss: float = 0.0          # random (non-congestive) loss probability per packet
+    change_time: float = None  # seconds after start when bandwidth changes
+    change_factor: float = 1.0
+
+
+@dataclass
+class IntervalStats:
+    duration: float
+    sent: float
+    acked: float
+    lost: float
+    rtt_mean: float            # None if no ACKs arrived this interval
+    rtt_min: float
+    cwnd: float
+    inflight: float
+    bw: float                  # link rate at the end of the interval, bytes/s
+
+
+class LinkSim:
+    def __init__(self, params, seed=None, init_cwnd=INIT_CWND):
+        self.p = params
+        self.rng = np.random.default_rng(seed)
+        self.bw = params.bw_mbps * 1e6 / 8 * MSS / (MSS + HEADER)  # QUIC bytes/s
+        self.t = 0.0
+        self.queue = 0.0
+        self.inflight = 0.0
+        self.cwnd = float(init_cwnd)
+        self.srtt = params.rtt
+        self.acks = deque()     # (arrival time, bytes, rtt)
+        self.losses = deque()   # (detection time, bytes)
+        self.last_ack_time = 0.0
+        self.pkt_acc = 0.0
+        self.loss_debt = 0.0
+        self.changed = False
+        self.total_acked = 0.0
+        self.keep_trace = False   # set True to record one RTT value per ms step (for p95)
+        self.rtt_trace = []
+
+    def run_interval(self, duration):
+        p, dt = self.p, DT
+        sent = acked = lost = 0.0
+        rtt_sum = rtt_w = 0.0
+        rtt_min = math.inf
+        for _ in range(max(1, int(round(duration / dt)))):
+            if p.change_time is not None and not self.changed and self.t >= p.change_time:
+                self.bw *= p.change_factor
+                self.changed = True
+
+            s = min(max(self.cwnd - self.inflight, 0.0), self.cwnd / max(self.srtt, 1e-3) * dt)
+            self.inflight += s
+            sent += s
+
+            drop = 0.0
+            if p.loss > 0 and s > 0:
+                self.pkt_acc += s / MSS
+                k = int(self.pkt_acc)
+                if k:
+                    self.pkt_acc -= k
+                    self.loss_debt += self.rng.binomial(k, p.loss) * MSS
+                drop = min(self.loss_debt, s)
+                self.loss_debt -= drop
+
+            self.queue += s - drop
+            tail = 0.0
+            if self.queue > p.queue_bytes:
+                tail = self.queue - p.queue_bytes
+                self.queue = p.queue_bytes
+            served = min(self.queue, self.bw * dt)
+            self.queue -= served
+            qdelay = self.queue / self.bw
+
+            if served > 0:
+                t_ack = max(self.t + p.rtt + qdelay, self.last_ack_time)
+                self.last_ack_time = t_ack
+                self.acks.append((t_ack, served, p.rtt + qdelay))
+            if drop + tail > 0:
+                self.losses.append((self.t + p.rtt + qdelay, drop + tail))
+
+            self.t += dt
+            step_w = step_rs = 0.0
+            while self.acks and self.acks[0][0] <= self.t:
+                _, b, r = self.acks.popleft()
+                self.inflight -= b
+                acked += b
+                rtt_sum += r * b
+                rtt_w += b
+                step_w += b
+                step_rs += r * b
+                rtt_min = min(rtt_min, r)
+            if self.keep_trace and step_w > 0:
+                self.rtt_trace.append(step_rs / step_w)
+            while self.losses and self.losses[0][0] <= self.t:
+                _, b = self.losses.popleft()
+                self.inflight -= b
+                lost += b
+            if self.inflight < 0:
+                self.inflight = 0.0
+
+        self.total_acked += acked
+        rtt_mean = rtt_sum / rtt_w if rtt_w > 0 else None
+        if rtt_mean is not None:
+            self.srtt = 0.5 * self.srtt + 0.5 * rtt_mean
+        return IntervalStats(duration, sent, acked, lost, rtt_mean,
+                             rtt_min if rtt_w > 0 else None, self.cwnd, self.inflight, self.bw)
+
+
+def interval_reward(stats, base_rtt, weights):
+    """reward = a * throughput - b * delay - c * loss, all roughly in [0, 1].
+    throughput: delivered rate / current link rate
+    delay:      (mean RTT - base RTT) / base RTT, clipped to [0, 3]
+    loss:       lost / (acked + lost)
+    Uses the true base RTT and link rate, which only the simulator knows: fine for training."""
+    a, b, c = weights
+    thr = (stats.acked / stats.duration) / stats.bw
+    delay = 0.0 if stats.rtt_mean is None else min(max((stats.rtt_mean - base_rtt) / base_rtt, 0.0), 3.0)
+    tot = stats.acked + stats.lost
+    loss = stats.lost / tot if tot > 0 else 0.0
+    return a * thr - b * delay - c * loss, dict(thr=thr, delay=delay, loss=loss)
+
+
+# ----- randomized training conditions and the lab-matching scenarios -----------------
+TRAIN = dict(bw_mbps=(2.0, 20.0), rtt_ms=(20.0, 120.0), queue_bdp=(0.5, 2.0),
+             loss_max=0.02, loss_zero_prob=0.4,
+             change_prob=0.5, change_time=(2.0, 10.0), change_factor=(0.25, 4.0))
+# NOT seen in training (held-out tests): rtt above 120 ms (S4 uses 200 ms), loss above 2%,
+# bandwidth above 20 Mbit/s, queue below 0.5 BDP. S5 is defined from these after training.
+
+
+def _bdp(bw_mbps, rtt):
+    return bw_mbps * 1e6 / 8 * rtt
+
+
+def sample_params(rng, r=TRAIN):
+    bw = math.exp(rng.uniform(math.log(r["bw_mbps"][0]), math.log(r["bw_mbps"][1])))
+    rtt = rng.uniform(*r["rtt_ms"]) / 1000
+    qb = rng.uniform(*r["queue_bdp"]) * _bdp(bw, rtt)
+    loss = 0.0 if rng.random() < r["loss_zero_prob"] else rng.uniform(0.001, r["loss_max"])
+    ct, cf = None, 1.0
+    if rng.random() < r["change_prob"]:
+        ct = rng.uniform(*r["change_time"])
+        cf = math.exp(rng.uniform(math.log(r["change_factor"][0]), math.log(r["change_factor"][1])))
+        # keep the new rate between 1 and 20 Mbit/s: the training range tops out at 20, and
+        # rates above it must stay unseen so the held-out bandwidth test is a real test
+        cf = min(max(cf, 1.0 / bw), r["bw_mbps"][1] / bw)
+    return LinkParams(bw, rtt, qb, loss, ct, cf)
+
+
+def scenario_params(name):
+    """Same settings as experiments/run_experiments.py (queue = 1 BDP of the starting rate)."""
+    if name == "S1":
+        return LinkParams(10, 0.040, _bdp(10, 0.040))
+    if name == "S2":
+        return LinkParams(10, 0.040, _bdp(10, 0.040), loss=0.01)
+    if name == "S3":
+        return LinkParams(20, 0.040, _bdp(20, 0.040), change_time=3.0, change_factor=0.25)
+    if name == "S4":
+        return LinkParams(10, 0.200, _bdp(10, 0.200))
+    if name == "S5a":
+        return LinkParams(10, 0.040, _bdp(10, 0.040), loss=0.04)
+    if name == "S5b":
+        return LinkParams(10, 0.250, _bdp(10, 0.250))
+    if name == "S5c":
+        return LinkParams(10, 0.040, 0.2 * _bdp(10, 0.040))
+    raise KeyError(name)
+
+
+FILE_MB = {"S1": 10, "S2": 10, "S3": 25, "S4": 10, "S5a": 10, "S5b": 10, "S5c": 10}  # same file sizes as the lab runs
